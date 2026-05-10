@@ -1,7 +1,7 @@
-# lightweight-fomo
+# Wavelet Diffusion Model for Neuroimage Foundation Modeling with FOMO45K
 
-`lightweight-fomo` packages the current code path for our wavelet-domain
-diffusion pretraining and downstream neuroimaging experiments.
+This repository contains the current code path for our wavelet-domain
+diffusion pretraining, distilled backbone, and downstream experiments.
 
 The repo is scoped to three downstream tasks:
 
@@ -12,15 +12,15 @@ The repo is scoped to three downstream tasks:
 ## Layout
 
 - `src/pretraining`
-  - wavelet-domain diffusion pretraining and distilled student backbone
+  - wavelet diffusion pretraining and distilled student backbone
 - `src/downstream`
   - fine-tuning entry point, task models, losses, and shared data code
 - `pipelines/brain_age`
   - dataset construction, split building, training, inference, and result export
 - `pipelines/fcd_classification`
-  - corrected ds004199 FCD classification pipeline
+  - ds004199 FCD classification pipeline
 - `pipelines/fcd_segmentation`
-  - corrected ds004199 FCD segmentation pipeline
+  - ds004199 FCD segmentation pipeline
 - `pipelines/shared`
   - shared audit utilities
 
@@ -36,34 +36,22 @@ Pipeline files use a small set of verb-first names:
 
 ## Preprocessing contract
 
-Offline preprocessing is intentionally aligned across pretraining and downstream
-dataset builders. The shared definition lives in
-`src/downstream/data/preprocessing_defaults.py` and is used for:
+The model-facing preprocessing used throughout this repo is:
 
-- per-volume z-normalization
 - crop-to-nonzero foreground
 - `RAS` orientation
 - `1 mm` isotropic spacing
 - `keep_aspect_ratio_when_using_target_size=False`
 - `transpose=[0, 1, 2]`
+- `1st/99th percentile intensity scaling to `[-1, 1]` before the wavelet transform`
 
-This means the current checkpoint-compatible pipeline uses a two-stage
-normalization path:
-
-1. offline export applies `volume_wise_znorm`
-2. model input applies percentile scaling to `[-1, 1]`
-
-That is the path used by the checkpoints and downstream results in this repo.
-It is intentionally different from a pure geometry-only export pipeline because
-changing the offline normalization now would no longer match the existing
-pretrained weights and benchmark results.
+That percentile scaling is the intensity normalization that matters for
+describing the method, because it is the normalization applied at model input
+for pretraining, distillation, fine-tuning, and inference.
 
 For multimodal FCD tasks, FLAIR is first resampled into T1 space and masked
-with the T1 brain mask before the shared preprocessing contract is applied.
-
-For CleanDIFT, runtime intensity handling is also matched to pretraining: inputs
-are center pad/cropped to the model patch size and then robustly scaled with the
-same 1st/99th percentile mapping to `[-1, 1]` before the wavelet transform.
+with the T1 brain mask before the shared geometry preprocessing and final
+model-input scaling are applied.
 
 ## What is in scope
 
@@ -77,7 +65,7 @@ same 1st/99th percentile mapping to `[-1, 1]` before the wavelet transform.
 - large preprocessed arrays
 - pretrained checkpoints
 - experiment logs
-- bulky QC assets and exploratory result dumps
+- QC assets and exploratory result dumps
 
 ## Reproducibility
 
