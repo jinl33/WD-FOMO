@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.DS_Store
+results/
+checkpoints/
+wandb/
+logs/
+.pytest_cache/
