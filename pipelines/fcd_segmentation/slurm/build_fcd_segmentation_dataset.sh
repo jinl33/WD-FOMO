@@ -5,7 +5,7 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=4  # 2026-09-06 FIX: spgpu nodes are 32 CPU / 8 GPU = 4 CPU/GPU; requesting 8 for a
 #SBATCH --mem=48G
 #SBATCH --time=08:00:00
 #SBATCH --output=/nfs/turbo/umms-wilms1/FOMO/experiments/jinhlee/logs/%x-%j.log
@@ -22,7 +22,7 @@ PREP_SCRIPT="${REPO_ROOT}/pipelines/fcd_segmentation/scripts/build_fcd_segmentat
 
 SOURCE_DIR="${SOURCE_DIR:-/nfs/turbo/umms-wilms1/FOMO/Data/fomo300k/raw_nifti/PT030_OpenNeuro/ds004199}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/nfs/turbo/umms-wilms1/FOMO/Data/openneuro_task10_t1flairseg_1mm_20260507}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
 NUM_FOLDS="${NUM_FOLDS:-5}"
 
 SKULL_STRIP_FLAG=""

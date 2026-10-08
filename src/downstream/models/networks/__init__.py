@@ -21,8 +21,15 @@ from .cleandift import (
     cleandift_tiny,
     cleandift_s15,
     cleandift_s23,
+    cleandift_s23_hc16,
     cleandift_s23_multitap,
     cleandift_s23_pefttap,
     cleandift_s33,
     cleandift_s33_pefttap,
+)
+
+from .cleandift_notime import (
+    cleandift_s23_hc16_notime,
+    cleandift_s23_notime,
+    strip_time_conditioning,
 )

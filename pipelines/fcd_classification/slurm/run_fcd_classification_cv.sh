@@ -5,14 +5,26 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=4  # 2026-09-06 FIX: spgpu nodes are 32 CPU / 8 GPU = 4 CPU/GPU; requesting 8 for a
 #SBATCH --mem=48G
 #SBATCH --time=08:00:00
 #SBATCH --output=/nfs/turbo/umms-wilms1/FOMO/experiments/jinhlee/logs/%x-%j.log
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+if [[ -n "${LIGHTWEIGHT_FOMO_ROOT:-}" ]]; then
+  REPO_ROOT="${LIGHTWEIGHT_FOMO_ROOT}"
+elif [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/lightweight-fomo/src/downstream/finetune.py" ]]; then
+  REPO_ROOT="${SLURM_SUBMIT_DIR}/lightweight-fomo"
+elif [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/src/downstream/finetune.py" ]]; then
+  REPO_ROOT="${SLURM_SUBMIT_DIR}"
+else
+  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+fi
+if [[ ! -f "${REPO_ROOT}/src/downstream/finetune.py" ]]; then
+  echo "[ERROR] REPO_ROOT=${REPO_ROOT} does not contain src/downstream/finetune.py" >&2
+  exit 10
+fi
 
 module load python/3.10.4
 source "${FOMO_ENV:-/scratch/wilms_root/wilms0/jinhlee/fomo-diffusion/fomo_env/bin/activate}"
@@ -27,17 +39,17 @@ export WANDB_DISABLED=true
 DATA_ROOT="${DATA_ROOT:-/nfs/turbo/umms-wilms1/FOMO/Data/openneuro_task9_t1flair_1mm_20260428}"
 TASK_NAME="${TASK_NAME:-Task009_OpenNeuro_ds004199_FCD_T1FLAIR_1mm}"
 TASK_DIR="${DATA_ROOT}/${TASK_NAME}"
-SAVE_DIR="${SAVE_DIR:-/nfs/turbo/umms-wilms1/FOMO/benchmark_results_task9_ds004199_t1flair_cv_20260428}"
+FOLD_IDX="${FOLD_IDX:-0}"
+SAVE_DIR="${SAVE_DIR:-/nfs/turbo/umms-wilms1/FOMO/benchmark_results_task9_ds004199_t1flair_cv_20260428}/fold${FOLD_IDX}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/nfs/turbo/umms-wilms1/FOMO/inference_outputs/task9_ds004199_t1flair_cv_20260428}"
 
 MODEL_NAME="${MODEL_NAME:-cleandift_s23}"
-FOLD_IDX="${FOLD_IDX:-0}"
 FOLDS="${FOLDS:-5}"
 AUGMENTATION_PRESET="${AUGMENTATION_PRESET:-basic}"
 EPOCHS="${EPOCHS:-100}"
 TRAIN_BATCHES="${TRAIN_BATCHES:-100}"
 LEARNING_RATE="${LEARNING_RATE:-1e-4}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
 
 case "${MODEL_NAME}" in
   unet_b)
@@ -62,6 +74,16 @@ case "${MODEL_NAME}" in
     ;;
   cleandift_s23)
     PRETRAINED="${PRETRAINED:-/nfs/turbo/umms-wilms1/FOMO/experiments/jinhlee/checkpoints_scaled/fomo_s23_72h_e100/fomo_s23_72h_e100/fomo_s23_72h_e100_epoch_100.pt}"
+    PATCH_D="${PATCH_D:-192}"; PATCH_H="${PATCH_H:-256}"; PATCH_W="${PATCH_W:-192}"
+    BATCH_SIZE="${BATCH_SIZE:-2}"
+    ;;
+  cleandift_s23_hc16)
+    PRETRAINED="${PRETRAINED:-/nfs/turbo/umms-wilms1/FOMO/experiments/jinhlee/checkpoints_scaled/fomo_s23_72h_e100/fomo_s23_72h_e100/fomo_s23_72h_e100_epoch_100.pt}"
+    PATCH_D="${PATCH_D:-192}"; PATCH_H="${PATCH_H:-256}"; PATCH_W="${PATCH_W:-192}"
+    BATCH_SIZE="${BATCH_SIZE:-2}"
+    ;;
+  cleandift_s23_hc16_notime|cleandift_s23_notime)
+    : "${PRETRAINED:?cleandift_s23_*notime requires an explicit PRETRAINED (masked-reconstruction checkpoint)}"
     PATCH_D="${PATCH_D:-192}"; PATCH_H="${PATCH_H:-256}"; PATCH_W="${PATCH_W:-192}"
     BATCH_SIZE="${BATCH_SIZE:-2}"
     ;;

@@ -31,7 +31,7 @@ from yucca.modules.data.datasets.YuccaDataset import YuccaTrainDataset
 
 from yucca.pipeline.configuration.split_data import get_split_config
 from yucca.pipeline.configuration.configure_paths import detect_version
-from data.dataset import FOMODataset
+from data.dataset import FOMODataset, ModalitySelectYuccaTrainDataset
 from data.task_configs import (
     task1_config,
     task2_config,
@@ -42,8 +42,9 @@ from data.task_configs import (
     task8_config,
     task9_config,
     task10_config,
+    task11_config,
+    task12_config,
 )
-
 
 def get_task_config(taskid):
     if taskid == 1:
@@ -64,13 +65,16 @@ def get_task_config(taskid):
         task_cfg = task9_config
     elif taskid == 10:
         task_cfg = task10_config
+    elif taskid == 11:
+        task_cfg = task11_config
+    elif taskid == 12:
+        task_cfg = task12_config
     else:
         raise ValueError(
-            f"Unknown taskid: {taskid}. Supported IDs are 1, 2, 3, 5, 6, 7, 8, 9, and 10"
+            f"Unknown taskid: {taskid}. Supported IDs are 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, and 12"
         )
 
     return task_cfg
-
 
 def main():
     logging.getLogger().setLevel(logging.INFO)
@@ -112,6 +116,16 @@ def main():
         help="Explicit (D, H, W) patch size. If set, overrides --patch_size.",
     )
     parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument(
+        "--backbone_learning_rate",
+        type=float,
+        default=None,
+        help=(
+            "Optional lower learning rate for pretrained CleanDIFT backbone "
+            "parameters. The main --learning_rate is used for task-specific "
+            "heads, fusion layers, and decoders."
+        ),
+    )
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--compile_mode", type=str, default=None)
     parser.add_argument("--num_devices", type=int, default=1)
@@ -167,9 +181,120 @@ def main():
     parser.add_argument(
         "--segmentation_loss",
         type=str,
-        choices=["dicece", "focaltversky"],
+        choices=[
+            "dicece",
+            "dicece_sizeaware",
+            "dicece_nobg",
+            "dicece_nobg_wce",
+            "focaltversky",
+            "focaltverskyce",
+            "focaltverskyce_wce",
+            "generalizeddice",
+            "generalizeddicece",
+            "tverskyce",
+        ],
         default=None,
         help="Override segmentation loss for Tasks 2 / 10.",
+    )
+    parser.add_argument(
+        "--seg_attention",
+        type=str,
+        choices=["none", "se"],
+        default="none",
+        help="Optional segmentation decoder attention variant for CleanDIFT.",
+    )
+    parser.add_argument(
+        "--seg_head_variant",
+        type=str,
+        choices=[
+            "earlyfusion",
+            "waveletavg",
+            "waveletweighted",
+            "waveletavg_refine",
+            "waveletweighted_refine",
+            "image_refine_v1",
+            "image_refine_ms",
+            "image_refine_ms_aux",
+            "featureavg",
+            "latefusion_logits",
+            "flairskip_latefusion",
+            "modality_expert",
+            "modality_expert_softmax",
+            "modality_expert_avg",
+            "modality_expert_logitconv",
+            "modality_expert_featureconcat",
+            "modality_expert_sharedbackbone",
+            "image_refine",
+            "cascade_refine",
+            "image_refine_ptdec",
+            "waveletavg_refine_ptdec",
+        ],
+        default="earlyfusion",
+        help="Segmentation-head variant for CleanDIFT dense prediction.",
+    )
+    parser.add_argument(
+        "--seg_output_fg_prior",
+        type=float,
+        default=None,
+        help=(
+            "Optional binary foreground prior for initializing the CleanDIFT "
+            "segmentation output bias."
+        ),
+    )
+    parser.add_argument(
+        "--seg_aux_loss_weight",
+        type=float,
+        default=0.0,
+        help="Optional auxiliary boundary-loss weight for CleanDIFT segmentation heads.",
+    )
+    parser.add_argument(
+        "--seg_aux_target",
+        type=str,
+        choices=["binary_band", "distance_shell"],
+        default="binary_band",
+        help="Target style for the CleanDIFT auxiliary boundary branch.",
+    )
+    parser.add_argument(
+        "--seg_boundary_radius",
+        type=int,
+        default=1,
+        help="Morphological radius used to define auxiliary boundary supervision.",
+    )
+    parser.add_argument(
+        "--seg_small_lesion_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Extra per-voxel CE weight applied to voxels that belong to small "
+            "lesions when segmentation_loss=dicece_sizeaware."
+        ),
+    )
+    parser.add_argument(
+        "--seg_small_lesion_thresholds",
+        type=int,
+        nargs=3,
+        default=[1000, 10000, 50000],
+        metavar=("SMALL", "MEDIUM", "LARGE"),
+        help=(
+            "Voxel-count thresholds for size-aware lesion weighting. Lesions up "
+            "to SMALL get the full extra weight, then taper through MEDIUM and LARGE."
+        ),
+    )
+    parser.add_argument(
+        "--p_oversample_foreground",
+        type=float,
+        default=0.33,
+        help="Probability that a segmentation training patch is forced to include foreground.",
+    )
+    parser.add_argument(
+        "--input_modality_indices",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional zero-based modality indices to use from a preprocessed "
+            "multi-modal case. Example for Task10 FLAIR-only: --input_modality_indices 1."
+        ),
     )
     parser.add_argument(
         "--early_stopping_patience",
@@ -232,7 +357,8 @@ def main():
             "Task ID (1: FOMO1 classification, 2: FOMO2 segmentation, 3: FOMO3 regression, "
             "5/6/7: FOMO300K brain-age variants, 8: legacy ds004199 export, "
             "9: corrected ds004199 T1+FLAIR FCD classification, "
-            "10: corrected ds004199 T1+FLAIR FCD lesion segmentation)"
+            "10: corrected ds004199 T1+FLAIR FCD lesion segmentation, "
+            "11: BrainLat T1 SynthSeg anatomical warm-up)"
         ),
     )
     parser.add_argument(
@@ -257,14 +383,47 @@ def main():
     else:
         patch_size_tuple = (args.patch_size,) * 3
 
-    for ps in patch_size_tuple:
-        assert ps % 8 == 0, f"Patch size dims must be divisible by 8, got {ps}"
+    if args.model_name.startswith("cleandift"):
+        bad = [ps for ps in patch_size_tuple if ps % 8 != 0]
+        if bad:
+            print(
+                "Allowing non-divisible patch dims for CleanDIFT because the "
+                "wavelet backbone pads internally before feature extraction: "
+                f"{patch_size_tuple}"
+            )
+    else:
+        for ps in patch_size_tuple:
+            assert ps % 8 == 0, f"Patch size dims must be divisible by 8, got {ps}"
 
     task_cfg = get_task_config(args.taskid)
     task_type = task_cfg["task_type"]
     task_name = task_cfg["task_name"]
     num_classes = task_cfg["num_classes"]
-    modalities = len(task_cfg["modalities"])
+    task_modalities = task_cfg["modalities"]
+    if args.input_modality_indices is not None:
+        bad = [
+            idx
+            for idx in args.input_modality_indices
+            if idx < 0 or idx >= len(task_modalities)
+        ]
+        if bad:
+            raise ValueError(
+                f"Requested modality indices {bad}, but task {task_name} has "
+                f"{len(task_modalities)} modalities: {task_modalities}"
+            )
+        modalities = len(args.input_modality_indices)
+        selected_modalities = tuple(task_modalities[idx] for idx in args.input_modality_indices)
+        os.environ["FOMO_INPUT_MODALITY_INDICES"] = ",".join(
+            str(idx) for idx in args.input_modality_indices
+        )
+        print(
+            "Using modality subset: "
+            f"indices={args.input_modality_indices}, names={selected_modalities}"
+        )
+    else:
+        modalities = len(task_modalities)
+        selected_modalities = task_modalities
+        os.environ.pop("FOMO_INPUT_MODALITY_INDICES", None)
     labels = task_cfg["labels"]
 
     run_type = "from_scratch" if args.pretrained_weights_path is None else "finetune"
@@ -286,7 +445,11 @@ def main():
 
     if "kfold" in args.split_method:
         split_param = int(args.split_param)
-    elif args.split_method in ["simple_train_val_split", "stratified_train_val_split"]:
+    elif args.split_method in [
+        "simple_train_val_split",
+        "stratified_train_val_split",
+        "stratified_train_val_test_split",
+    ]:
         split_param = float(args.split_param)
     else:
         split_param = args.split_param
@@ -328,12 +491,15 @@ def main():
         "seed": seed,
         "num_classes": num_classes,
         "num_modalities": modalities,
+        "input_modality_indices": args.input_modality_indices,
+        "selected_modalities": selected_modalities,
         "image_extension": ".npy",
         "allow_missing_modalities": False,
         "labels": labels,
         "batch_size": args.batch_size,
         "accumulate_grad_batches": args.accumulate_grad_batches,
         "learning_rate": args.learning_rate,
+        "backbone_learning_rate": args.backbone_learning_rate,
         "patch_size": patch_size_tuple,
         "precision": args.precision,
         "augmentation_preset": args.augmentation_preset,
@@ -344,6 +510,15 @@ def main():
         "regression_smoothl1_beta": args.regression_smoothl1_beta,
         "regression_rank_loss_weight": args.regression_rank_loss_weight,
         "segmentation_loss": args.segmentation_loss,
+        "seg_attention": args.seg_attention,
+        "seg_head_variant": args.seg_head_variant,
+        "seg_output_fg_prior": args.seg_output_fg_prior,
+        "seg_aux_loss_weight": args.seg_aux_loss_weight,
+        "seg_aux_target": args.seg_aux_target,
+        "seg_boundary_radius": args.seg_boundary_radius,
+        "seg_small_lesion_weight": args.seg_small_lesion_weight,
+        "seg_small_lesion_thresholds": args.seg_small_lesion_thresholds,
+        "p_oversample_foreground": args.p_oversample_foreground,
         "train_dataset_size": train_dataset_size,
         "val_dataset_size": val_dataset_size,
         "max_iterations": max_iterations,
@@ -363,9 +538,9 @@ def main():
     }
 
     checkpoint_callback = ModelCheckpoint(
-        every_n_epochs=10,
-        save_top_k=1,
-        filename="last",
+        save_top_k=0,
+        save_last=True,
+        filename="{epoch}",
         enable_version_counter=False,
     )
     best_checkpoint_callback = ModelCheckpoint(
@@ -406,7 +581,9 @@ def main():
 
     data_module = YuccaDataModule(
         train_dataset_class=(
-            YuccaTrainDataset if task_type == "segmentation" else FOMODataset
+            ModalitySelectYuccaTrainDataset
+            if task_type == "segmentation"
+            else FOMODataset
         ),
         composed_train_transforms=augmenter.train_transforms,
         composed_val_transforms=augmenter.val_transforms,
@@ -418,6 +595,7 @@ def main():
         splits_config=splits_config,
         split_idx=config["split_idx"],
         num_workers=args.num_workers,
+        p_oversample_foreground=args.p_oversample_foreground,
         val_sampler=None,
     )
 
@@ -472,17 +650,54 @@ def main():
         state_dict = load_pretrained_weights(args.pretrained_weights_path, args.compile)
 
         if args.model_name.startswith("cleandift"):
-            remapped = {}
-            for k, v in state_dict.items():
-                if k.startswith("model."):
-                    new_key = k.replace("model.", "model.backbone.", 1)
-                    remapped[new_key] = v
-                elif k.startswith("teacher.") or k.startswith("projection_heads."):
-                    continue
-                else:
-                    remapped["model.backbone." + k] = v
-            state_dict = remapped
-            print(f"Remapped {len(remapped)} CleanDIFT backbone keys")
+            state_expander = getattr(model.model, "expand_pretrained_state_dict", None)
+            downstream_ckpt = any(
+                k.startswith("model.backbone.") or k.startswith("model.decoder.")
+                for k in state_dict.keys()
+            )
+            if state_expander is not None:
+                state_dict = state_expander(state_dict, prefix="model.")
+                print(
+                    "Expanded CleanDIFT pretrained backbone keys for "
+                    f"modality-expert branches: {len(state_dict)} keys"
+                )
+            elif downstream_ckpt:
+                compatible = {}
+                model_state = model.state_dict()
+                backbone_n = 0
+                decoder_n = 0
+                other_n = 0
+                for k, v in state_dict.items():
+                    if k.startswith("model.modality_fusion."):
+                        continue
+                    if k.startswith("model.decoder.final."):
+                        continue
+                    if k in model_state and model_state[k].shape == v.shape:
+                        compatible[k] = v
+                        if k.startswith("model.backbone."):
+                            backbone_n += 1
+                        elif k.startswith("model.decoder."):
+                            decoder_n += 1
+                        else:
+                            other_n += 1
+                state_dict = compatible
+                print(
+                    "Loaded downstream CleanDIFT warm-up checkpoint: "
+                    f"{len(compatible)} compatible keys "
+                    f"(backbone={backbone_n}, decoder={decoder_n}, other={other_n})"
+                )
+            else:
+                remapped = {}
+                for k, v in state_dict.items():
+                    if k.startswith("model."):
+                        new_key = k.replace("model.", "model.backbone.", 1)
+                        remapped[new_key] = v
+                    elif k.startswith("teacher.") or k.startswith("projection_heads."):
+                        continue
+                    else:
+                        remapped["model.backbone." + k] = v
+                state_dict = remapped
+                print(f"Remapped {len(remapped)} CleanDIFT backbone keys")
 
         model_keys = set(model.state_dict().keys())
         ckpt_keys = set(state_dict.keys())
@@ -507,7 +722,6 @@ def main():
         print("Training from scratch, no weights will be transferred")
 
     trainer.fit(model=model, datamodule=data_module, ckpt_path="last")
-
 
 if __name__ == "__main__":
     main()

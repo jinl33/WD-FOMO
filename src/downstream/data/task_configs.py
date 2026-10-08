@@ -1,6 +1,5 @@
 from data.preprocessing_defaults import OFFLINE_EXPORT_NORM_OP
 
-
 task1_config = {
     "task_name": "Task001_FOMO1",
     "crop_to_nonzero": True,
@@ -116,4 +115,30 @@ task10_config = {
     "task_type": "segmentation",
     "label_extension": ".txt",
     "labels": {0: "background", 1: "FCD lesion"},
+}
+
+task11_config = {
+    "task_name": "Task011_BrainLat_SynthSeg_T1_1mm",
+    "crop_to_nonzero": True,
+    "deep_supervision": False,
+    "modalities": ("T1",),
+    "norm_op": OFFLINE_EXPORT_NORM_OP,
+    "num_classes": 33,
+    "keep_aspect_ratio": False,
+    "task_type": "segmentation",
+    "label_extension": ".txt",
+    "labels": {i: f"class_{i}" for i in range(33)},
+}
+
+task12_config = {
+    "task_name": "Task012_ATLAS2_StrokeLesion_T1_1mm",
+    "crop_to_nonzero": True,
+    "deep_supervision": False,
+    "modalities": ("T1",),
+    "norm_op": OFFLINE_EXPORT_NORM_OP,
+    "num_classes": 2,
+    "keep_aspect_ratio": False,
+    "task_type": "segmentation",
+    "label_extension": ".txt",
+    "labels": {0: "background", 1: "stroke lesion"},
 }

@@ -41,7 +41,6 @@ random.seed(42)
 np.random.seed(42)
 torch.set_float32_matmul_precision("high")
 
-
 parser = argparse.ArgumentParser(description="ALL-Data FOMO Diffusion Model Training")
 parser.add_argument(
     "--data_path", type=str, required=True, help="Path to the preprocessed dataset"
@@ -52,7 +51,7 @@ parser.add_argument(
     default=None,
     help="Path to canonical split JSON (fomo60k_split.json). When provided, uses pretrain list directly to avoid distillation data leakage.",
 )
-parser.add_argument("--batch_size", type=int, default=2, help="Batch size for training")
+parser.add_argument("--batch_size", type=int, default=4, help="Batch size for training (manuscript Sec. 3.1: 4)")
 parser.add_argument(
     "--num_workers", type=int, default=6, help="Number of data loader workers"
 )
@@ -179,7 +178,6 @@ os.makedirs(checkpoint_dir, exist_ok=True)
 os.makedirs(logs_dir, exist_ok=True)
 os.makedirs(tensorboard_dir, exist_ok=True)
 
-
 def pywt_decompose_cpu(x):
     packet = pywt.WaveletPacketND(
         x.get_array(), "haar", axes=(-3, -2, -1), maxlevel=levels
@@ -193,19 +191,12 @@ def pywt_decompose_cpu(x):
     gc.collect()
     return x
 
-
 def identity_transform(x):
     img_np = x.get_array()
     x.set_array(torch.from_numpy(img_np).float())
     return x
 
-
 def robust_scale_intensity(x):
-    """
-    Robust percentile-based scaling that handles flat/corrupted images.
-    Safely handles edge cases without losing training data.
-    CRITICAL: Must never produce NaN or Inf values.
-    """
     img = x.get_array().astype(np.float32)
 
     if not np.isfinite(img).all():
@@ -222,9 +213,9 @@ def robust_scale_intensity(x):
             if np.abs(denominator) < 1e-10:
                 img = np.random.normal(0, 0.01, img.shape).astype(np.float32)
             else:
-                img = (img - p1) / denominator  # [0, 1]
+                img = (img - p1) / denominator
                 img = np.clip(img, 0, 1)
-                img = img * 2.0 - 1.0  # [-1, 1]
+                img = img * 2.0 - 1.0
 
     if not np.isfinite(img).all():
         print(
@@ -235,16 +226,13 @@ def robust_scale_intensity(x):
     x.set_array(torch.from_numpy(img).float())
     return x
 
-
 lambd_pywt = monai.transforms.Lambdad(keys=["image"], func=pywt_decompose_cpu)
 lambd_identity = monai.transforms.Lambdad(keys=["image"], func=identity_transform)
 lambd_robust_scale = monai.transforms.Lambdad(
     keys=["image"], func=robust_scale_intensity
 )
 
-
 class NumpyLoader(monai.data.ImageReader):
-    """Load .npy files with proper error handling"""
 
     def read(self, data, **kwargs):
         img = np.load(data).astype(np.float32)
@@ -255,7 +243,6 @@ class NumpyLoader(monai.data.ImageReader):
 
     def verify_suffix(self, filename):
         return filename.endswith(".npy")
-
 
 wavelet_transform = lambd_identity if gpu_dwt is not None else lambd_pywt
 
@@ -288,7 +275,6 @@ test_transforms = monai.transforms.Compose(
     ]
 )
 
-
 def _is_spacing_1mm(spacing, tol=1e-4):
     if spacing is None:
         return False
@@ -300,9 +286,7 @@ def _is_spacing_1mm(spacing, tol=1e-4):
         return False
     return bool(np.all(np.abs(spacing_arr[:3] - 1.0) <= tol))
 
-
 def verify_preprocessed_metadata(data_path, sample_count=2048, seed=42):
-    """Validate that input files are Yucca-preprocessed with 1mm spacing + crop metadata."""
     pkl_files = glob.glob(os.path.join(data_path, "*.pkl"))
     if not pkl_files:
         raise RuntimeError(
@@ -355,7 +339,6 @@ def verify_preprocessed_metadata(data_path, sample_count=2048, seed=42):
         "all have matching .npy, new_spacing≈[1,1,1], crop_to_nonzero metadata present."
     )
 
-
 def get_everything_data(data_path, split_ratios=(0.8, 0.2), split_json=None):
     import json as _json
 
@@ -363,8 +346,8 @@ def get_everything_data(data_path, split_ratios=(0.8, 0.2), split_json=None):
         print(f"Loading canonical split from: {split_json}")
         with open(split_json) as f:
             split = _json.load(f)
-        pretrain_files = split["pretrain"]  # 41,483 files
-        distil_files = set(split["distillation"])  # 5,000 files (excluded)
+        pretrain_files = split["pretrain"]
+        distil_files = set(split["distillation"])
         print(
             f"  Canonical pretrain: {len(pretrain_files)}, distillation (excluded): {len(distil_files)}"
         )
@@ -441,7 +424,6 @@ def get_everything_data(data_path, split_ratios=(0.8, 0.2), split_json=None):
     print(f"Training: {len(train_files)}, Validation: {len(val_files)}")
     return train_files, val_files
 
-
 def _build_attention_levels(num_levels, mode):
     if mode == "none":
         return [False] * num_levels
@@ -457,10 +439,8 @@ def _build_attention_levels(num_levels, mode):
         return [True]
     return [False] * (num_levels - 2) + [True, True]
 
-
 def _build_head_channels(attention_levels, head_ch):
     return [head_ch if use_attn else 0 for use_attn in attention_levels]
-
 
 def _resolve_model_channels():
     scale_map = {
@@ -477,13 +457,11 @@ def _resolve_model_channels():
         return args.custom_num_channels
     return scale_map[args.model_scale]
 
-
 def _resolve_norm_num_groups(num_channels_cfg):
     for groups in (32, 16, 8, 4, 2, 1):
         if all(ch % groups == 0 for ch in num_channels_cfg):
             return groups
     raise ValueError(f"No valid norm_num_groups found for channels: {num_channels_cfg}")
-
 
 def _build_model_config():
     num_channels_cfg = _resolve_model_channels()
@@ -508,9 +486,7 @@ def _build_model_config():
         "with_conditioning": False,
     }
 
-
 MODEL_CONFIG = _build_model_config()
-
 
 def report_model_efficiency(model):
     total_params = sum(p.numel() for p in model.parameters())
@@ -527,10 +503,8 @@ def report_model_efficiency(model):
     print(f"  Trainable parameters: {trainable_params:,}")
     print(f"  Parameter memory (fp32): {fp32_mib:.2f} MiB")
 
-
 def get_model():
     return DiffusionModelUNet(**MODEL_CONFIG)
-
 
 def main():
     print(f"Foundational Model Training - ALL AVAILABLE DATA")
@@ -660,7 +634,6 @@ def main():
 
     @trainer.on(ignite.engine.Events.ITERATION_COMPLETED)
     def check_nan_during_training(engine):
-        """Detect NaN/Inf in loss immediately to fail fast"""
         avg_loss = engine.state.metrics.get("avg_loss", None)
         if avg_loss is not None and not torch.isfinite(
             torch.tensor(avg_loss, dtype=torch.float32)
@@ -722,7 +695,6 @@ def main():
     finally:
         writer.close()
         print("Training finished.")
-
 
 if __name__ == "__main__":
     main()

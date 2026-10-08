@@ -5,7 +5,7 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=4  # 2026-09-06 FIX: spgpu nodes are 32 CPU / 8 GPU = 4 CPU/GPU; requesting 8 for a
 #SBATCH --mem=48G
 #SBATCH --time=18:00:00
 #SBATCH --output=/nfs/turbo/umms-wilms1/FOMO/experiments/jinhlee/logs/%x-%j.log
@@ -43,7 +43,7 @@ EPOCHS="${EPOCHS:-100}"
 TRAIN_BATCHES="${TRAIN_BATCHES:-100}"
 LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 AUGMENTATION_PRESET="${AUGMENTATION_PRESET:-all}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
 
 python3 << PYEOF
 import json

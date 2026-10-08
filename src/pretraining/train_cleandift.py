@@ -1,269 +1,323 @@
+import argparse
+import json
+import math
+import os
+import random
+import time
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import argparse
-import os
-import gc
-import math
-import pywt
-import monai
-from tqdm import tqdm
-from generative.networks.nets import DiffusionModelUNet
-from generative.networks.schedulers import DDIMScheduler
-import utils
+from torch.utils.data import DataLoader, Dataset
 
-CHANNELS = 64
-LEVELS = 2
-INITIAL_SIZE = [192, 256, 192]
-TARGET_SIZE = [48, 64, 48]
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-class NumpyLoader(monai.data.ImageReader):
-    def read(self, data, **kwargs):
-        img = np.load(data).astype(np.float32)
-        return img, {"spatial_shape": img.shape}
-
-    def get_data(self, img):
-        return img[0], img[1]
-
-    def verify_suffix(self, filename):
-        return filename.endswith(".npy")
-
-
-def pywt_decompose(x):
-    packet = pywt.WaveletPacketND(
-        x.get_array(), "haar", axes=(-3, -2, -1), maxlevel=LEVELS
-    )
-    x.set_array(
-        torch.tensor(
-            np.concatenate([y.data.view() for y in packet.get_level(LEVELS)], axis=0)
-            / 8.0
-        )
-    )
-    gc.collect()
-    return x
-
-
-lambd_pywt = monai.transforms.Lambdad(keys=["image"], func=pywt_decompose)
-
-train_transforms = monai.transforms.Compose(
-    [
-        monai.transforms.LoadImaged(
-            keys=["image"], reader=NumpyLoader(), ensure_channel_first=True
-        ),
-        monai.transforms.ResizeWithPadOrCropd(
-            keys=["image"], spatial_size=INITIAL_SIZE
-        ),
-        monai.transforms.ScaleIntensityRangePercentilesd(
-            keys="image", lower=1, upper=99, b_min=-1, b_max=1, clip=True
-        ),
-        lambd_pywt,
-        monai.transforms.ToTensord(keys=["image"], track_meta=False),
-    ]
+from gpu_wavelet import HaarDWT3D_2Level
+from paper_configs import (
+    BETA_END,
+    BETA_START,
+    DISTILL_TAPS,
+    NUM_TRAIN_TIMESTEPS,
+    SCALE_CHANNELS,
+    VOLUME_SHAPE,
+    WAVELET_NORMALIZE,
+    build_unet,
 )
 
+TIME_EMBED_DIM = 256
 
-class SinusoidalPosEmb(nn.Module):
-    def __init__(self, dim):
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--teacher_ckpt", required=True, help="Pretrained teacher checkpoint (paper_232m profile)")
+    p.add_argument("--data_path", required=True, help="Directory with preprocessed .npy volumes")
+    p.add_argument("--split_json", required=True, help="JSON with a 'distillation' list of held-out files")
+    p.add_argument("--output_dir", required=True)
+    p.add_argument("--model_prefix", default="cleandift")
+    p.add_argument("--teacher_scale", default="paper_232m", choices=list(SCALE_CHANNELS))
+    p.add_argument("--student_scale", default="s23", choices=list(SCALE_CHANNELS))
+    p.add_argument("--student_init", default="random", choices=["random", "copy"])
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument("--lr_peak", type=float, default=5e-7)
+    p.add_argument("--lr_min", type=float, default=2e-7)
+    p.add_argument("--warmup_epochs", type=float, default=2.0)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--resume_epoch", type=int, default=None, help="Resume from cleandift_epoch_{n}.pt")
+    p.add_argument("--max_steps", type=int, default=None, help="Stop after this many steps (smoke tests)")
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    return p.parse_args()
+
+def robust_scale(volume: np.ndarray) -> np.ndarray:
+    if not np.isfinite(volume).all():
+        raise ValueError("non-finite voxels in input volume; exclude this file")
+    p1, p99 = np.percentile(volume, [1, 99])
+    if abs(p99 - p1) < 1e-6:
+        raise ValueError("degenerate intensity range (flat volume); exclude this file")
+    scaled = np.clip((volume - p1) / (p99 - p1), 0.0, 1.0)
+    return (scaled * 2.0 - 1.0).astype(np.float32)
+
+def pad_or_crop_center(volume: np.ndarray, target=VOLUME_SHAPE) -> np.ndarray:
+    out = np.zeros(target, dtype=np.float32)
+    src_slices, dst_slices = [], []
+    for s, t in zip(volume.shape, target):
+        n = min(s, t)
+        s0 = (s - n) // 2
+        d0 = (t - n) // 2
+        src_slices.append(slice(s0, s0 + n))
+        dst_slices.append(slice(d0, d0 + n))
+    out[tuple(dst_slices)] = volume[tuple(src_slices)]
+    return out
+
+class VolumeDataset(Dataset):
+    def __init__(self, files):
+        self.files = files
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, i):
+        vol = np.load(self.files[i]).astype(np.float32)
+        vol = pad_or_crop_center(vol)
+        vol = robust_scale(vol)
+        return torch.from_numpy(vol)[None]
+
+def distillation_files(data_path, split_json):
+    with open(split_json) as f:
+        split = json.load(f)
+    files = []
+    for f in split["distillation"]:
+        candidate = os.path.join(data_path, os.path.basename(f))
+        if os.path.exists(candidate):
+            files.append(candidate)
+    if not files:
+        raise RuntimeError(f"No distillation files found under {data_path}")
+    return files
+
+def alpha_bar_table(device):
+    betas = torch.linspace(BETA_START, BETA_END, NUM_TRAIN_TIMESTEPS, dtype=torch.float64)
+    return torch.cumprod(1.0 - betas, dim=0).to(device=device, dtype=torch.float32)
+
+def add_noise(x0, noise, t, alpha_bar):
+    ab = alpha_bar[t].view(-1, 1, 1, 1, 1)
+    return ab.sqrt() * x0 + (1.0 - ab).sqrt() * noise
+
+def sinusoidal_embedding(t, dim=TIME_EMBED_DIM):
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / (half - 1))
+    args = t.float()[:, None] * freqs[None]
+    return torch.cat([args.sin(), args.cos()], dim=1)
+
+def _groups(channels):
+    for g in (32, 16, 8, 4, 2, 1):
+        if channels % g == 0:
+            return g
+    return 1
+
+class FiLMResBlock(nn.Module):
+    def __init__(self, channels):
         super().__init__()
-        self.dim = dim
+        self.norm1 = nn.GroupNorm(_groups(channels), channels)
+        self.film1 = nn.Linear(TIME_EMBED_DIM, 2 * channels)
+        self.conv1 = nn.Conv3d(channels, channels, kernel_size=1)
+        self.norm2 = nn.GroupNorm(_groups(channels), channels)
+        self.film2 = nn.Linear(TIME_EMBED_DIM, 2 * channels)
+        self.conv2 = nn.Conv3d(channels, channels, kernel_size=1)
 
-    def forward(self, x):
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
+    @staticmethod
+    def _film(x, emb, film):
+        gamma, beta = film(emb).chunk(2, dim=1)
+        return x * (1 + gamma[:, :, None, None, None]) + beta[:, :, None, None, None]
 
+    def forward(self, x, emb):
+        h = self._film(self.norm1(x), emb, self.film1)
+        h = self.conv1(F.silu(h))
+        h = self._film(self.norm2(h), emb, self.film2)
+        h = self.conv2(F.silu(h))
+        return x + h
 
 class ProjectionHead(nn.Module):
-    def __init__(self, feature_dim, time_dim=512):
+
+    def __init__(self, in_channels, out_channels):
         super().__init__()
         self.time_mlp = nn.Sequential(
-            SinusoidalPosEmb(time_dim),
-            nn.Linear(time_dim, time_dim),
-            nn.SiLU(),
-            nn.Linear(time_dim, feature_dim),
+            nn.Linear(TIME_EMBED_DIM, TIME_EMBED_DIM), nn.SiLU(), nn.Linear(TIME_EMBED_DIM, TIME_EMBED_DIM)
         )
-        self.projector = nn.Sequential(
-            nn.Conv3d(feature_dim, feature_dim, kernel_size=1),
-            nn.GroupNorm(32, feature_dim),
-            nn.SiLU(),
-            nn.Conv3d(feature_dim, feature_dim, kernel_size=1),
-            nn.GroupNorm(32, feature_dim),
-            nn.SiLU(),
-            nn.Conv3d(feature_dim, feature_dim, kernel_size=1),
-        )
-        nn.init.zeros_(self.projector[-1].weight)
-        nn.init.zeros_(self.projector[-1].bias)
+        self.blocks = nn.ModuleList([FiLMResBlock(in_channels), FiLMResBlock(in_channels)])
+        self.out = nn.Conv3d(in_channels, out_channels, kernel_size=1)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
 
     def forward(self, x, t):
-        t_emb = self.time_mlp(t)  # [B, C]
-        t_emb = t_emb[:, :, None, None, None]
-        h = x + t_emb
-        return self.projector(h)
+        emb = self.time_mlp(sinusoidal_embedding(t))
+        for block in self.blocks:
+            x = block(x, emb)
+        return self.out(x)
 
+def register_tap_hooks(unet, storage):
+    def make(name):
+        def hook(_m, _i, out):
+            storage[name] = out
+        return hook
 
-class CleanDIFTDistiller(nn.Module):
-    def __init__(self, teacher_checkpoint):
-        super().__init__()
-        print(f"Initializing Multi-Layer CleanDIFT with Teacher: {teacher_checkpoint}")
-        self.teacher = self._get_unet()
-        self.student = self._get_unet()
+    unet.middle_block.register_forward_hook(make("middle"))
+    unet.up_blocks[0].register_forward_hook(make("up0"))
+    unet.up_blocks[1].register_forward_hook(make("up1"))
 
-        self.projectors = nn.ModuleDict(
-            {
-                "middle": ProjectionHead(feature_dim=512),
-                "up1": ProjectionHead(feature_dim=256),
-            }
-        )
+def learning_rate(epoch_float, args):
+    if epoch_float < args.warmup_epochs:
+        return args.lr_peak * epoch_float / args.warmup_epochs
+    progress = (epoch_float - args.warmup_epochs) / max(args.epochs - args.warmup_epochs, 1e-8)
+    progress = min(max(progress, 0.0), 1.0)
+    return args.lr_min + (args.lr_peak - args.lr_min) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
-        ckpt = torch.load(teacher_checkpoint, map_location="cpu", weights_only=False)
-        state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+def load_teacher(args, device):
+    teacher = build_unet(args.teacher_scale).to(device)
+    ckpt = torch.load(args.teacher_ckpt, map_location="cpu", weights_only=False)
+    state = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+    teacher.load_state_dict(state, strict=True)
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    return teacher
 
-        self.teacher.load_state_dict(state_dict)
-        self.student.load_state_dict(state_dict)
-
-        self.teacher.eval()
-        for param in self.teacher.parameters():
-            param.requires_grad = False
-
-        self.teacher_feats = {}
-        self.student_feats = {}
-
-        self._register_hooks(self.teacher, self.teacher_feats)
-        self._register_hooks(self.student, self.student_feats)
-
-    def _get_unet(self):
-        return DiffusionModelUNet(
-            spatial_dims=3,
-            in_channels=CHANNELS,
-            out_channels=CHANNELS,
-            num_channels=[32, 64, 128, 256],
-            attention_levels=[False, False, True, True],
-            num_head_channels=[0, 0, 32, 32],
-            num_res_blocks=2,
-            use_flash_attention=False,
-            with_conditioning=False,
-        )
-
-    def _register_hooks(self, model, storage):
-        """Attach hooks to target layers"""
-
-        def hook_mid(module, input, output):
-            storage["middle"] = output
-
-        model.middle_block.register_forward_hook(hook_mid)
-
-        def hook_up1(module, input, output):
-            storage["up1"] = output
-
-        model.up_blocks[1].register_forward_hook(hook_up1)
-
+def build_student(args, teacher, device):
+    student = build_unet(args.student_scale).to(device)
+    if args.student_init == "copy":
+        student.load_state_dict(teacher.state_dict(), strict=True)
+    return student
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--teacher_ckpt", type=str, required=True)
-    parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument(
-        "--output_dir", type=str, default="./cleandift_multilayer_checkpoints"
-    )
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    args = parser.parse_args()
-
+    args = parse_args()
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    device = torch.device(args.device)
     os.makedirs(args.output_dir, exist_ok=True)
+    log_path = os.path.join(args.output_dir, "distill_log.jsonl")
 
-    train_files, _ = utils.get_fomo_data(args.data_path, pattern="*t1*.npy")
-    train_ds = monai.data.Dataset(
-        data=[{"image": f} for f in train_files], transform=train_transforms
-    )
-    train_loader = monai.data.DataLoader(
-        train_ds,
+    teacher = load_teacher(args, device)
+    student = build_student(args, teacher, device)
+    dwt = HaarDWT3D_2Level(normalize_factor=WAVELET_NORMALIZE).to(device)
+    alpha_bar = alpha_bar_table(device)
+
+    teacher_feats, student_feats = {}, {}
+    register_tap_hooks(teacher, teacher_feats)
+    register_tap_hooks(student, student_feats)
+
+    heads = nn.ModuleDict(
+        {
+            "middle": ProjectionHead(SCALE_CHANNELS[args.student_scale][-1], SCALE_CHANNELS[args.teacher_scale][-1]),
+            "up0": ProjectionHead(SCALE_CHANNELS[args.student_scale][-1], SCALE_CHANNELS[args.teacher_scale][-1]),
+            "up1": ProjectionHead(SCALE_CHANNELS[args.student_scale][-2], SCALE_CHANNELS[args.teacher_scale][-2]),
+        }
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(list(student.parameters()) + list(heads.parameters()), lr=args.lr_peak)
+
+    start_epoch = 0
+    if args.resume_epoch is not None:
+        ck_path = os.path.join(args.output_dir, f"{args.model_prefix}_epoch_{args.resume_epoch}.pt")
+        ck = torch.load(ck_path, map_location="cpu", weights_only=False)
+        student.load_state_dict(ck["model_state_dict"], strict=True)
+        heads.load_state_dict(ck["projector_state_dict"], strict=True)
+        optimizer.load_state_dict(ck["optimizer_state_dict"])
+        start_epoch = ck["epoch"] + 1
+        print(f"Resumed from {ck_path} (next epoch {start_epoch})", flush=True)
+
+    files = distillation_files(args.data_path, args.split_json)
+    loader = DataLoader(
+        VolumeDataset(files),
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True,
+        num_workers=args.num_workers,
+        drop_last=False,
+        pin_memory=device.type == "cuda",
+        generator=torch.Generator().manual_seed(args.seed),
     )
+    steps_per_epoch = len(loader)
+    print(f"Distillation files: {len(files)} | steps/epoch: {steps_per_epoch} | device: {device}", flush=True)
 
-    distiller = CleanDIFTDistiller(args.teacher_ckpt).to(DEVICE)
+    global_step = 0
+    for epoch in range(start_epoch, args.epochs):
+        student.train()
+        heads.train()
+        epoch_loss, epoch_steps, t0 = 0.0, 0, time.time()
+        for batch_idx, volumes in enumerate(loader):
+            epoch_float = epoch + batch_idx / steps_per_epoch
+            lr = learning_rate(epoch_float, args)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
 
-    optimizer = torch.optim.AdamW(
-        list(distiller.student.parameters()) + list(distiller.projectors.parameters()),
-        lr=args.lr,
-    )
+            volumes = volumes.to(device, non_blocking=True)
+            with torch.no_grad():
+                x0 = dwt(volumes)
+            bsz = x0.shape[0]
+            t = torch.randint(0, NUM_TRAIN_TIMESTEPS, (bsz,), device=device)
+            noise = torch.randn_like(x0)
+            xt = add_noise(x0, noise, t, alpha_bar)
 
-    scaler = torch.amp.GradScaler("cuda")
+            with torch.no_grad():
+                teacher(xt, timesteps=t)
+            t_zero = torch.zeros_like(t)
+            student(x0, timesteps=t_zero)
 
-    criterion = nn.MSELoss()
+            loss = 0.0
+            for name in DISTILL_TAPS:
+                projected = heads[name](student_feats[name], t)
+                target = teacher_feats[name].detach()
+                loss = loss - F.cosine_similarity(projected, target, dim=1).mean()
 
-    noise_scheduler = DDIMScheduler(num_train_timesteps=1000)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"non-finite distillation loss at epoch {epoch} step {batch_idx}")
 
-    print(f"Starting Multi-Layer Distillation for {args.epochs} epochs...")
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
 
-    for epoch in range(args.epochs):
-        distiller.student.train()
-        for p in distiller.projectors.values():
-            p.train()
+            epoch_loss += loss.item()
+            epoch_steps += 1
+            global_step += 1
+            if batch_idx % 50 == 0:
+                print(f"epoch {epoch + 1} step {batch_idx}/{steps_per_epoch} loss {loss.item():.6f} lr {lr:.3e}", flush=True)
+            if args.max_steps is not None and global_step >= args.max_steps:
+                break
 
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
-        for batch in pbar:
-            clean_images = batch["image"].to(DEVICE)
-            bs = clean_images.shape[0]
+        mean_loss = epoch_loss / max(epoch_steps, 1)
+        record = {
+            "epoch": epoch + 1,
+            "mean_loss": mean_loss,
+            "lr_end": lr,
+            "seconds": round(time.time() - t0, 1),
+        }
+        with open(log_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+        print(f"epoch {epoch + 1} done: mean loss {mean_loss:.6f}", flush=True)
 
-            timesteps = torch.randint(0, 1000, (bs,), device=DEVICE).long()
-            noise = torch.randn_like(clean_images).to(DEVICE)
-            noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
-
-            optimizer.zero_grad()
-
-            with torch.amp.autocast("cuda"):
-                with torch.no_grad():
-                    distiller.teacher(noisy_images, timesteps=timesteps)
-
-                t_zeros = torch.zeros_like(timesteps)
-                distiller.student(clean_images, timesteps=t_zeros)
-
-                total_loss = 0
-                for layer_name, projector in distiller.projectors.items():
-                    student_feat = distiller.student_feats[layer_name]
-                    teacher_feat = distiller.teacher_feats[layer_name].detach()
-
-                    projected_feat = projector(student_feat, timesteps)
-
-                    total_loss += criterion(projected_feat, teacher_feat)
-
-            scaler.scale(total_loss).backward()
-
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(distiller.student.parameters(), 1.0)
-
-            scaler.step(optimizer)
-            scaler.update()
-
-            pbar.set_postfix({"loss": f"{total_loss.item():.6f}"})
-
-        save_path = os.path.join(
-            args.output_dir, f"cleandift_student_epoch_{epoch+1}.pt"
-        )
+        ck_path = os.path.join(args.output_dir, f"{args.model_prefix}_epoch_{epoch + 1}.pt")
         torch.save(
             {
                 "epoch": epoch,
-                "model_state_dict": distiller.student.state_dict(),
-                "projector_state_dict": {
-                    k: v.state_dict() for k, v in distiller.projectors.items()
+                "model_state_dict": student.state_dict(),
+                "projector_state_dict": heads.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "config": {
+                    "teacher_scale": args.teacher_scale,
+                    "student_scale": args.student_scale,
+                    "student_init": args.student_init,
+                    "taps": list(DISTILL_TAPS),
+                    "lr_peak": args.lr_peak,
+                    "lr_min": args.lr_min,
+                    "warmup_epochs": args.warmup_epochs,
+                    "epochs": args.epochs,
+                    "seed": args.seed,
                 },
             },
-            save_path,
+            ck_path,
         )
-        print(f"Checkpoint saved: {save_path}")
+        print(f"Checkpoint saved: {ck_path}", flush=True)
 
+        if args.max_steps is not None and global_step >= args.max_steps:
+            break
 
 if __name__ == "__main__":
     main()

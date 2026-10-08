@@ -8,15 +8,49 @@ from typing import Tuple, Optional, Literal
 from batchgenerators.utilities.file_and_folder_operations import load_pickle
 from yucca.modules.data.augmentation.transforms.cropping_and_padding import CropPad
 from yucca.modules.data.augmentation.transforms.formatting import NumpyToTorch
+from yucca.modules.data.datasets.YuccaDataset import YuccaTrainDataset
 
 from batchgenerators.utilities.file_and_folder_operations import join
 
+def _parse_modality_indices_from_env():
+    raw = os.environ.get("FOMO_INPUT_MODALITY_INDICES", "").strip()
+    if not raw:
+        return None
+    return [int(part) for part in raw.replace(",", " ").split()]
+
+class ModalitySelectYuccaTrainDataset(YuccaTrainDataset):
+
+    def __init__(self, *args, modality_indices=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.modality_indices = (
+            list(modality_indices)
+            if modality_indices is not None
+            else _parse_modality_indices_from_env()
+        )
+
+    def unpack(self, data, supervised: bool):
+        image, label = super().unpack(data, supervised)
+        return self._select_modalities(image), label
+
+    def unpack_with_zeros(self, data, supervised: bool):
+        image, label = super().unpack_with_zeros(data, supervised)
+        return self._select_modalities(image), label
+
+    def _select_modalities(self, image):
+        if self.modality_indices is None:
+            return image
+        if len(self.modality_indices) == 0:
+            raise ValueError("FOMO_INPUT_MODALITY_INDICES was set but empty")
+        n_modalities = len(image)
+        bad = [idx for idx in self.modality_indices if idx < 0 or idx >= n_modalities]
+        if bad:
+            raise IndexError(
+                f"Requested modality indices {bad}, but image has {n_modalities} modalities"
+            )
+        selected = [np.asarray(image[idx]) for idx in self.modality_indices]
+        return np.stack(selected, axis=0)
 
 class FOMODataset(Dataset):
-    """
-    Dataset class for FOMO downstream tasks. Supports classification and regression tasks.
-    For segmentation tasks, use YuccaTrainDataset from the Yucca library instead.
-    """
 
     def __init__(
         self,
@@ -24,8 +58,8 @@ class FOMODataset(Dataset):
         patch_size: Tuple[int, int, int],
         composed_transforms: Optional[torchvision.transforms.Compose] = None,
         task_type: Literal["classification", "regression"] = "classification",
-        allow_missing_modalities: Optional[bool] = False,  # For compatibility
-        p_oversample_foreground: Optional[float] = None,  # For compatibility
+        allow_missing_modalities: Optional[bool] = False,
+        p_oversample_foreground: Optional[float] = None,
     ):
         super().__init__()
         assert task_type in [
@@ -79,7 +113,7 @@ class FOMODataset(Dataset):
         txt_file = file + ".txt"
         if self.task_type == "classification":
             return np.loadtxt(txt_file, dtype=int)
-        else:  # regression
+        else:
             reg_label = np.loadtxt(txt_file, dtype=float)
             reg_label = np.atleast_1d(reg_label)
             return reg_label
@@ -96,7 +130,6 @@ class FOMODataset(Dataset):
             vol = vol[np.newaxis, ...]
 
         return vol
-
 
 class PretrainDataset(Dataset):
     def __init__(
@@ -136,7 +169,7 @@ class PretrainDataset(Dataset):
 
         data_dict = {
             "file_path": case
-        }  # metadata that can be very useful for debugging.
+        }
         metadata = {"foreground_locations": []}
         data_dict["image"] = data
 
